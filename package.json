@@ -1,0 +1,27 @@
+{
+  "name": "trufurrs-backend-node",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Node.js backend for Trufurrs MQTT to Firestore processing",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "keywords": [
+    "mqtt",
+    "firestore",
+    "tracking",
+    "iot"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@google-cloud/firestore": "^8.0.0",
+    "dotenv": "^17.2.3",
+    "mqtt": "^5.14.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.11"
+  }
+}
