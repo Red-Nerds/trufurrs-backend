@@ -1,4 +1,5 @@
-import { Firestore } from '@google-cloud/firestore';
+import { Firestore, FieldValue } from '@google-cloud/firestore';
+import { performanceMonitor } from '../monitoring/performance.js';
 
 export class FirestoreClient {
   constructor(projectId, batchSize = 500, batchTimeout = 3000) {
@@ -24,6 +25,10 @@ export class FirestoreClient {
    */
   async queueTelemetry(telemetry) {
     this.telemetryQueue.push(telemetry);
+    
+    // Track queue size
+    performanceMonitor.recordQueueSize(this.telemetryQueue.length);
+    
     console.log(`📦 Queued telemetry (queue size: ${this.telemetryQueue.length})`);
 
     // Start batch timer if not already running
@@ -53,18 +58,21 @@ export class FirestoreClient {
     const telemetryCount = this.telemetryQueue.length;
 
     if (telemetryCount === 0) {
-      console.log('📭 Queue empty, nothing to flush'); // ADD THIS
+      console.log('📭 Queue empty, nothing to flush');
       return;
     }
 
     this.isProcessing = true;
     this.batchTimer = null;
 
-    console.log(`\n⏰ BATCH TIMEOUT TRIGGERED`); // ADD THIS
+    console.log(`\n⏰ BATCH TIMEOUT TRIGGERED`);
+
+    // Declare telemetryItems outside try block so it's accessible in catch
+    let telemetryItems = [];
 
     try {
       // Process all items in chunks of batchSize
-      const telemetryItems = [...this.telemetryQueue];
+      telemetryItems = [...this.telemetryQueue];
 
       // Clear queues immediately
       this.telemetryQueue = [];
@@ -78,18 +86,18 @@ export class FirestoreClient {
       // Combine operations and process in chunks
       await this.processBatchChunks(telemetryItems);
 
-      console.log(`✅ Batch complete: ${telemetryCount + deviceUpdateCount} operations written to Firestore\n`); // ADD newline
+      console.log(`✅ Batch complete: ${telemetryCount + deviceUpdateCount} operations written to Firestore\n`);
 
     } catch (error) {
       console.error('❌ Batch flush error:', error);
       // Re-queue failed items
-      this.telemetryQueue.push(...telemetryItems); // FIX: was pushing to itself
+      this.telemetryQueue.push(...telemetryItems);
     } finally {
       this.isProcessing = false;
 
       // Restart timer if there are more items
       if (this.telemetryQueue.length > 0) {
-        console.log(`🔄 Restarting timer, ${this.telemetryQueue.length} items in queue`); // ADD THIS
+        console.log(`🔄 Restarting timer, ${this.telemetryQueue.length} items in queue`);
         this.batchTimer = setTimeout(() => this.flushBatches(), this.batchTimeout);
       }
     }
@@ -101,18 +109,25 @@ export class FirestoreClient {
   async processBatchChunks(telemetryItems) {
     const allOperations = [];
 
-    // Prepare telemetry operations
+    // Prepare telemetry operations - organized by device/date/points
     for (const telemetry of telemetryItems) {
       const collection = this.getCollectionName(telemetry.tag_type);
-      const timestampMillis = Date.now();
-      const telemetryDocId = `${telemetry.device_id}_${timestampMillis}`;
-
+      
+      // Get date in YYYYMMDD format from telemetry timestamp
+      const telemetryDate = new Date(telemetry.created_at);
+      const dateString = telemetryDate.toISOString().split('T')[0].replace(/-/g, ''); // YYYYMMDD
+      
+      // Use timestamp from telemetry as document ID
+      const telemetryTimestamp = new Date(telemetry.created_at).getTime();
+      
+      // Path: telemetry_active/{device_id}/{date}/points/{timestamp}
       allOperations.push({
         type: 'telemetry',
         collection,
-        docId: telemetryDocId,
-        data: telemetry,
         deviceId: telemetry.device_id,
+        date: dateString,
+        docId: telemetryTimestamp.toString(),
+        data: telemetry,
       });
     }
 
@@ -182,6 +197,26 @@ export class FirestoreClient {
     // Update location history arrays (after batch commits)
     await this.updateLocationHistories(deviceUpdates);
 
+    // Update telemetry metadata (points count per device per day)
+    const telemetryByDeviceDate = new Map();
+    for (const op of allOperations) {
+      if (op.type === 'telemetry') {
+        const key = `${op.deviceId}_${op.date}`;
+        const existing = telemetryByDeviceDate.get(key) || {
+          collection: op.collection,
+          deviceId: op.deviceId,
+          date: op.date,
+          count: 0
+        };
+        existing.count++;
+        telemetryByDeviceDate.set(key, existing);
+      }
+    }
+
+    for (const meta of telemetryByDeviceDate.values()) {
+      await this.updateTelemetryMetadata(meta.collection, meta.deviceId, meta.date, meta.count);
+    }
+
     // Update track metadata (points count per day)
     const tracksByDate = new Map();
     for (const point of trackPoints) {
@@ -204,28 +239,103 @@ export class FirestoreClient {
   async executeBatch(operations) {
     const batch = this.db.batch();
 
+    let telemetryCount = 0;
+    let deviceCount = 0;
+    let trackPointCount = 0;
+
     for (const op of operations) {
       if (op.type === 'telemetry') {
-        // Create/overwrite telemetry document
-        const docRef = this.db.collection(op.collection).doc(op.docId);
+        // Create telemetry in organized structure: collection/{device_id}/{date}/points/{timestamp}
+        const telemetryPath = `${op.collection}/${op.deviceId}/${op.date}/points`;
+        const docRef = this.db.collection(telemetryPath).doc(op.docId);
         batch.set(docRef, op.data);
+        telemetryCount++;
       }
       else if (op.type === 'device') {
         // Merge device update (liveLocation)
         const docRef = this.db.collection(op.collection).doc(op.docId);
         batch.set(docRef, op.data, { merge: true });
+        deviceCount++;
       }
       else if (op.type === 'track_point') {
         // Create track point in subcollection
         const trackPath = `devices/${op.deviceId}/tracks/${op.trackDate}/points`;
         const docRef = this.db.collection(trackPath).doc(op.pointId);
         batch.set(docRef, op.data);
+        trackPointCount++;
       }
     }
 
     console.log(`  ⏳ Committing ${operations.length} operations...`);
+    
+    // Track batch commit time
+    const batchTimer = performanceMonitor.startTimer('batchCommit');
     await batch.commit();
-    console.log(`  ✅ Committed ${operations.length} operations to Firestore`);
+    const commitDuration = performanceMonitor.endTimer(batchTimer);
+    
+    // Record Firestore operations
+    performanceMonitor.recordFirestoreOperation('write', telemetryCount, 'telemetryWrites');
+    performanceMonitor.recordFirestoreOperation('write', deviceCount, 'deviceWrites');
+    performanceMonitor.recordFirestoreOperation('write', trackPointCount, 'trackPointWrites');
+    
+    console.log(`  ✅ Committed ${operations.length} operations in ${commitDuration.toFixed(2)}ms`);
+    console.log(`     📝 ${telemetryCount} telemetry + ${deviceCount} devices + ${trackPointCount} track points`);
+    performanceMonitor.incrementCounter('totalBatches');
+  }
+
+  /**
+   * Initialize or update telemetry metadata for a day
+   * Path: telemetry_{type}/{device_id}/metadata/{date}
+   */
+  async updateTelemetryMetadata(collection, deviceId, date, pointsCount) {
+    const metadataTimer = performanceMonitor.startTimer('telemetryMetadataUpdate');
+    
+    try {
+      const metaRef = this.db
+        .collection(collection)
+        .doc(deviceId)
+        .collection('metadata')
+        .doc(date);
+
+      const metaDoc = await metaRef.get();
+      
+      // Record read operation
+      performanceMonitor.recordFirestoreOperation('read', 1, 'telemetryMetadataReads');
+
+      if (!metaDoc.exists) {
+        // Create new metadata
+        await metaRef.set({
+          deviceId: deviceId,
+          collection: collection,
+          date: date,
+          startTime: new Date().toISOString(),
+          endTime: new Date().toISOString(),
+          pointsCount: pointsCount,
+          createdAt: new Date().toISOString(),
+        });
+        
+        // Record write operation
+        performanceMonitor.recordFirestoreOperation('write', 1, 'telemetryMetadataWrites');
+        
+        const duration = performanceMonitor.endTimer(metadataTimer);
+        console.log(`  📊 Created telemetry metadata for ${deviceId} on ${date} in ${duration.toFixed(2)}ms`);
+      } else {
+        // Update existing metadata
+        await metaRef.update({
+          endTime: new Date().toISOString(),
+          pointsCount: FieldValue.increment(pointsCount),
+        });
+        
+        // Record write operation
+        performanceMonitor.recordFirestoreOperation('write', 1, 'telemetryMetadataWrites');
+        
+        const duration = performanceMonitor.endTimer(metadataTimer);
+        console.log(`  📊 Updated telemetry metadata in ${duration.toFixed(2)}ms`);
+      }
+    } catch (error) {
+      performanceMonitor.endTimer(metadataTimer);
+      console.error(`  ❌ Failed to update telemetry metadata:`, error.message);
+    }
   }
 
   /**
@@ -247,13 +357,20 @@ export class FirestoreClient {
         // Use Firestore array union (adds if not exists, max 10 at once)
         // For simplicity, we'll do manual trimming in a separate maintenance job
         batch.update(deviceRef, {
-          locationHistory: this.db.FieldValue.arrayUnion(update.locationPoint)
+          locationHistory: FieldValue.arrayUnion(update.locationPoint)
         });
       }
 
       try {
+        // Track location history update time
+        const historyTimer = performanceMonitor.startTimer('locationHistoryUpdate');
         await batch.commit();
-        console.log(`  📍 Updated location history batch (${chunk.length} devices)`);
+        const historyDuration = performanceMonitor.endTimer(historyTimer);
+        
+        // Record Firestore operations (1 write per device)
+        performanceMonitor.recordFirestoreOperation('write', chunk.length, 'locationHistoryWrites');
+        
+        console.log(`  📍 Updated location history batch (${chunk.length} devices) in ${historyDuration.toFixed(2)}ms`);
       } catch (error) {
         console.error(`  ❌ Failed to update location history batch:`, error.message);
       }
@@ -264,6 +381,9 @@ export class FirestoreClient {
    * Initialize or update track metadata for a day
    */
   async updateTrackMetadata(deviceId, trackDate, pointsCount) {
+    // Track metadata update time
+    const trackTimer = performanceMonitor.startTimer('trackMetadataUpdate');
+    
     try {
       const trackMetaRef = this.db
         .collection('devices')
@@ -272,6 +392,9 @@ export class FirestoreClient {
         .doc(trackDate);
 
       const trackMeta = await trackMetaRef.get();
+      
+      // Record read operation
+      performanceMonitor.recordFirestoreOperation('read', 1, 'trackMetadataReads');
 
       if (!trackMeta.exists) {
         // Create new track metadata
@@ -283,15 +406,27 @@ export class FirestoreClient {
           pointsCount: pointsCount,
           createdAt: new Date().toISOString(),
         });
-        console.log(`  📊 Created track metadata for ${deviceId} on ${trackDate}`);
+        
+        // Record write operation
+        performanceMonitor.recordFirestoreOperation('write', 1, 'trackMetadataWrites');
+        
+        const trackDuration = performanceMonitor.endTimer(trackTimer);
+        console.log(`  📊 Created track metadata for ${deviceId} on ${trackDate} in ${trackDuration.toFixed(2)}ms`);
       } else {
         // Update existing track metadata
         await trackMetaRef.update({
           endTime: new Date().toISOString(),
-          pointsCount: this.db.FieldValue.increment(pointsCount),
+          pointsCount: FieldValue.increment(pointsCount),
         });
+        
+        // Record write operation
+        performanceMonitor.recordFirestoreOperation('write', 1, 'trackMetadataWrites');
+        
+        const trackDuration = performanceMonitor.endTimer(trackTimer);
+        console.log(`  📊 Updated track metadata in ${trackDuration.toFixed(2)}ms`);
       }
     } catch (error) {
+      performanceMonitor.endTimer(trackTimer);
       console.error(`  ❌ Failed to update track metadata:`, error.message);
     }
   }
@@ -328,6 +463,10 @@ export class FirestoreClient {
         .where('isResolved', '==', false)
         .limit(1)
         .get();
+
+      // Record read operation (query counts as 1 read minimum)
+      const readCount = Math.max(1, snapshot.size);
+      performanceMonitor.recordFirestoreOperation('read', readCount, 'alertReads');
 
       const exists = !snapshot.empty;
 
@@ -389,6 +528,9 @@ export class FirestoreClient {
         .doc(); // Auto-generate ID
 
       await alertRef.set(alertData);
+      
+      // Record write operation
+      performanceMonitor.recordFirestoreOperation('write', 1, 'alertWrites');
 
       console.log(`   🚨 Created alert: ${alertId} for device ${deviceId}`);
       console.log(`      Type: ${alertTemplate.alertType}, Severity: ${alertTemplate.severity}`);

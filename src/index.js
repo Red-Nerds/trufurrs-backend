@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 import { MqttClient } from './mqtt/client.js';
 import { FirestoreClient } from './firestore/client.js';
 import { MessageProcessor } from './processor/handler.js';
+import { performanceMonitor } from './monitoring/performance.js';
 
 // Load environment variables
 dotenv.config();
@@ -63,17 +64,22 @@ async function main() {
     // Message counter for stats
     let messageCount = 0;
     let errorCount = 0;
-    const startTime = Date.now();
 
     // Handle incoming messages
     mqttClient.onMessage(async (topic, payload) => {
+      // START: Track overall message processing time
+      const messageTimer = performanceMonitor.startTimer('messageProcessing');
+      
       try {
         messageCount++;
+        performanceMonitor.incrementCounter('totalMessages');
 
         // Handle test/topic differently - just log
         if (topic === 'test/topic') {
           const payloadStr = payload.toString('utf8');
           console.log(`🧪 Test message received: ${payloadStr}`);
+          performanceMonitor.incrementCounter('successfulMessages');
+          performanceMonitor.endTimer(messageTimer);
           return;
         }
 
@@ -90,26 +96,46 @@ async function main() {
         const alertTemplate = processor.getAlertTemplate(telemetry);
         if (alertTemplate) {
           console.log(`   🔔 Alert detected: ${telemetry.alert_id}`);
+          
+          // Track alert processing time
+          const alertTimer = performanceMonitor.startTimer('alertProcessing');
           try {
-            await firestoreClient.processAlert(telemetry, alertTemplate);
+            const alertCreated = await firestoreClient.processAlert(telemetry, alertTemplate);
+            
+            if (alertCreated) {
+              performanceMonitor.incrementCounter('totalAlerts');
+            } else {
+              performanceMonitor.incrementCounter('skippedAlerts');
+            }
+            
+            const alertDuration = performanceMonitor.endTimer(alertTimer);
+            console.log(`   ⏱️  Alert processing took: ${alertDuration.toFixed(2)}ms`);
           } catch (error) {
+            performanceMonitor.endTimer(alertTimer);
             console.error(`   ❌ Alert processing failed: ${error.message}`);
             // Continue with telemetry processing even if alert fails
           }
         }
 
-        // Queue for batch processing
+        // Queue for batch processing (track queue size)
         await firestoreClient.queueTelemetry(telemetry);
+        
+        // Record successful processing
+        performanceMonitor.incrementCounter('successfulMessages');
+
+        // END: Track message processing time
+        const processingDuration = performanceMonitor.endTimer(messageTimer);
+        console.log(`⏱️  Total processing time: ${processingDuration.toFixed(2)}ms`);
 
         // Log stats every 100 messages
         if (messageCount % 100 === 0) {
-          const elapsed = (Date.now() - startTime) / 1000;
-          const rate = (messageCount / elapsed).toFixed(2);
-          console.log(`\n📊 Stats: ${messageCount} messages processed (${rate} msg/sec), ${errorCount} errors\n`);
+          performanceMonitor.printReport();
         }
 
       } catch (error) {
         errorCount++;
+        performanceMonitor.incrementCounter('failedMessages');
+        performanceMonitor.endTimer(messageTimer);
         console.error(`❌ Failed to process message from ${topic}:`, error.message);
       }
     });
@@ -121,12 +147,12 @@ async function main() {
       await mqttClient.disconnect();
       await firestoreClient.shutdown();
       
-      const elapsed = (Date.now() - startTime) / 1000;
-      console.log(`\n📊 Final Stats:`);
-      console.log(`   Total messages: ${messageCount}`);
-      console.log(`   Errors: ${errorCount}`);
-      console.log(`   Runtime: ${elapsed.toFixed(2)}s`);
-      console.log(`   Average rate: ${(messageCount / elapsed).toFixed(2)} msg/sec`);
+      // Print final performance report
+      console.log('\n📊 FINAL PERFORMANCE REPORT:');
+      performanceMonitor.printReport();
+      
+      // Print historical daily operations
+      performanceMonitor.printDailyHistory();
       
       console.log('\n👋 Goodbye!\n');
       process.exit(0);
