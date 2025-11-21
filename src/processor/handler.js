@@ -1,3 +1,5 @@
+import { getAlertTemplate, isRealtimeAlert } from '../alerts/templates.js';
+
 export class MessageProcessor {
   constructor() {}
 
@@ -49,6 +51,10 @@ export class MessageProcessor {
         gyro_z: jsonData.activity.gyro_z,
         temperature: jsonData.activity.temperature,
       },
+      compass: {
+        heading_degrees: jsonData.compass.heading_degrees,
+        direction: jsonData.compass.direction,
+      },
       device: {
         battery_level: jsonData.device.battery_level,
         heartbeat: jsonData.device.heartbeat,
@@ -56,6 +62,9 @@ export class MessageProcessor {
       fence: {
         fence_id: jsonData.fence.fence_id,
         status: jsonData.fence.status,
+        center_lat: jsonData.fence.center_lat,
+        center_lon: jsonData.fence.center_lon,
+        radius_m: jsonData.fence.radius_m,
         distance_m: jsonData.fence.distance_m,
       },
       created_at: new Date().toISOString(),
@@ -98,6 +107,7 @@ export class MessageProcessor {
       'user_id',
       'location',
       'activity',
+      'compass',
       'device',
       'fence',
     ];
@@ -126,6 +136,42 @@ export class MessageProcessor {
       }
     }
 
+    // Validate nested compass fields
+    const compassFields = ['heading_degrees', 'direction'];
+    for (const field of compassFields) {
+      if (data.compass[field] === undefined) {
+        throw new Error(`Missing compass field: ${field}`);
+      }
+    }
+
     return true;
+  }
+
+  /**
+   * Get alert template if alert_id is present and valid
+   */
+  getAlertTemplate(telemetry) {
+    const alertId = telemetry.alert_id;
+
+    // Skip if no alert_id or empty
+    if (!alertId || alertId === '') {
+      return null;
+    }
+
+    // Check if it's a real-time alert (Phase 1)
+    if (!isRealtimeAlert(alertId)) {
+      console.log(`   ⏭️  Skipping non-realtime alert: ${alertId} (will be processed by worker)`);
+      return null;
+    }
+
+    // Get template
+    const template = getAlertTemplate(alertId, telemetry);
+    
+    if (!template) {
+      console.warn(`   ⚠️  Unknown alert_id: ${alertId}`);
+      return null;
+    }
+
+    return template;
   }
 }

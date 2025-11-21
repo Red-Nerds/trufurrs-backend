@@ -86,6 +86,18 @@ async function main() {
         console.log(`   Battery: ${telemetry.device.battery_level}%`);
         console.log(`   GPS Signal: ${telemetry.location.GPS_signal}`);
 
+        // Check for alerts
+        const alertTemplate = processor.getAlertTemplate(telemetry);
+        if (alertTemplate) {
+          console.log(`   🔔 Alert detected: ${telemetry.alert_id}`);
+          try {
+            await firestoreClient.processAlert(telemetry, alertTemplate);
+          } catch (error) {
+            console.error(`   ❌ Alert processing failed: ${error.message}`);
+            // Continue with telemetry processing even if alert fails
+          }
+        }
+
         // Queue for batch processing
         await firestoreClient.queueTelemetry(telemetry);
 
