@@ -1,7 +1,7 @@
 import { getAlertTemplate, isRealtimeAlert } from '../alerts/templates.js';
 
 export class MessageProcessor {
-  constructor() {}
+  constructor() { }
 
   /**
    * Process incoming MQTT message
@@ -14,8 +14,8 @@ export class MessageProcessor {
     console.log(`   Tag type: ${tagType}`);
 
     // Convert payload to string
-    const payloadStr = payload.toString('utf8');
-    
+    let payloadStr = payload.toString('utf8').replace(/\0/g, '').trim();
+
     // Parse JSON
     let jsonData;
     try {
@@ -42,21 +42,9 @@ export class MessageProcessor {
         altitude: jsonData.location.altitude,
         timestamp: jsonData.location.timestamp,
       },
-      activity: {
-        acc_x: jsonData.activity.acc_x,
-        acc_y: jsonData.activity.acc_y,
-        acc_z: jsonData.activity.acc_z,
-        gyro_x: jsonData.activity.gyro_x,
-        gyro_y: jsonData.activity.gyro_y,
-        gyro_z: jsonData.activity.gyro_z,
-        temperature: jsonData.activity.temperature,
-      },
-      compass: {
-        heading_degrees: jsonData.compass.heading_degrees,
-        direction: jsonData.compass.direction,
-      },
       device: {
         battery_level: jsonData.device.battery_level,
+        step_count: jsonData.device.step_count,
         heartbeat: jsonData.device.heartbeat,
       },
       fence: {
@@ -79,24 +67,6 @@ export class MessageProcessor {
   }
 
   /**
-   * Extract tag type from MQTT topic
-   */
-  extractTagType(topic) {
-    // Expected format: trufurrs/{tag_type}/telemetry
-    const parts = topic.split('/');
-
-    if (parts.length >= 2 && parts[0] === 'trufurrs') {
-      const tagType = parts[1];
-      if (['tag', 'active', 'sense'].includes(tagType)) {
-        return tagType;
-      }
-      throw new Error(`Invalid tag_type in topic: ${tagType}`);
-    }
-
-    throw new Error(`Invalid topic format: ${topic}`);
-  }
-
-  /**
    * Validate telemetry data structure
    */
   validateTelemetry(data) {
@@ -106,8 +76,6 @@ export class MessageProcessor {
       'pet_id',
       'user_id',
       'location',
-      'activity',
-      'compass',
       'device',
       'fence',
     ];
@@ -136,15 +104,25 @@ export class MessageProcessor {
       }
     }
 
-    // Validate nested compass fields
-    const compassFields = ['heading_degrees', 'direction'];
-    for (const field of compassFields) {
-      if (data.compass[field] === undefined) {
-        throw new Error(`Missing compass field: ${field}`);
+    return true;
+  }
+
+  /**
+   * Extract tag type from MQTT topic
+   */
+  extractTagType(topic) {
+    // Expected format: trufurrs/{tag_type}/telemetry
+    const parts = topic.split('/');
+
+    if (parts.length >= 2 && parts[0] === 'trufurrs') {
+      const tagType = parts[1];
+      if (['tag', 'active', 'sense'].includes(tagType)) {
+        return tagType;
       }
+      throw new Error(`Invalid tag_type in topic: ${tagType}`);
     }
 
-    return true;
+    throw new Error(`Invalid topic format: ${topic}`);
   }
 
   /**
@@ -166,7 +144,7 @@ export class MessageProcessor {
 
     // Get template
     const template = getAlertTemplate(alertId, telemetry);
-    
+
     if (!template) {
       console.warn(`   ⚠️  Unknown alert_id: ${alertId}`);
       return null;

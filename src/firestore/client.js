@@ -120,7 +120,8 @@ export class FirestoreClient {
       // Use timestamp from telemetry as document ID
       const telemetryTimestamp = new Date(telemetry.created_at).getTime();
       
-      // Path: telemetry_active/{device_id}/{date}/points/{timestamp}
+      // Path: telemetry_active/{device_id}/dates/{date}/points/{timestamp}
+      // This is 5 segments (odd number) - correct for Firestore
       allOperations.push({
         type: 'telemetry',
         collection,
@@ -177,8 +178,8 @@ export class FirestoreClient {
           altitude: telemetry.location.altitude,
           GPS_signal: telemetry.location.GPS_signal,
           battery_level: telemetry.device.battery_level,
-          heading: telemetry.compass?.heading_degrees || null,
-          direction: telemetry.compass?.direction || null,
+          //heading: telemetry.compass?.heading_degrees || null,
+          //direction: telemetry.compass?.direction || null,
           timestamp: telemetry.location.timestamp,
           createdAt: new Date().toISOString(),
         }
@@ -245,8 +246,9 @@ export class FirestoreClient {
 
     for (const op of operations) {
       if (op.type === 'telemetry') {
-        // Create telemetry in organized structure: collection/{device_id}/{date}/points/{timestamp}
-        const telemetryPath = `${op.collection}/${op.deviceId}/${op.date}/points`;
+        // Create telemetry in organized structure: collection/{device_id}/dates/{date}/points/{timestamp}
+        // This gives us 5 path segments (odd number) which is correct for Firestore
+        const telemetryPath = `${op.collection}/${op.deviceId}/dates/${op.date}/points`;
         const docRef = this.db.collection(telemetryPath).doc(op.docId);
         batch.set(docRef, op.data);
         telemetryCount++;
@@ -285,7 +287,7 @@ export class FirestoreClient {
 
   /**
    * Initialize or update telemetry metadata for a day
-   * Path: telemetry_{type}/{device_id}/metadata/{date}
+   * Path: telemetry_{type}/{device_id}/dates/{date}/metadata
    */
   async updateTelemetryMetadata(collection, deviceId, date, pointsCount) {
     const metadataTimer = performanceMonitor.startTimer('telemetryMetadataUpdate');
@@ -294,8 +296,10 @@ export class FirestoreClient {
       const metaRef = this.db
         .collection(collection)
         .doc(deviceId)
+        .collection('dates')
+        .doc(date)
         .collection('metadata')
-        .doc(date);
+        .doc('stats');
 
       const metaDoc = await metaRef.get();
       
